@@ -1,0 +1,180 @@
+name: Temporary market data 5-minute extraction
+
+on:
+  push:
+    paths:
+      - '.github/workflows/temporary-market-data-5min.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-market-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch and validate 5-minute OHLCV
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+
+          TICKERS = [
+              'EC', 'AMRX', 'ALTO', 'NOK', 'HIMX', 'UMC', 'MTW', 'BFLY', 'OPTX',
+              'WTTR', 'PTEN', 'HLX', 'NGL', 'PBI', 'GLBS', 'SB', 'DSX', 'DHT', 'NAT'
+          ]
+          START_DATE = '2026-07-30'
+          END_DATE_INCLUSIVE = '2026-08-28'
+          NY = ZoneInfo('America/New_York')
+          OUT = 'market_data_5min'
+          os.makedirs(OUT, exist_ok=True)
+
+          start_utc = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+          end_exclusive_utc = datetime(2026, 8, 29, 0, 0, tzinfo=timezone.utc)
+          period1 = int(start_utc.timestamp())
+          period2 = int(end_exclusive_utc.timestamp())
+
+          manifest = []
+          failures = []
+          ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          for idx, ticker in enumerate(TICKERS, start=1):
+              params = {
+                  'period1': str(period1),
+                  'period2': str(period2),
+                  'interval': '5m',
+                  'includePrePost': 'false',
+                  'events': 'div,splits',
+              }
+              url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker) + '?' + urllib.parse.urlencode(params)
+              payload = None
+              last_error = None
+              for attempt in range(1, 5):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': ua,
+                          'Accept': 'application/json,text/plain,*/*',
+                      })
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          payload = json.loads(response.read().decode('utf-8'))
+                      break
+                  except Exception as exc:
+                      last_error = f'{type(exc).__name__}: {exc}'
+                      time.sleep(attempt * 3)
+              if payload is None:
+                  failures.append({'ticker': ticker, 'error': last_error})
+                  print(f'FAILED {ticker}: {last_error}')
+                  continue
+
+              chart = payload.get('chart') or {}
+              if chart.get('error') or not chart.get('result'):
+                  err = chart.get('error') or 'missing chart.result'
+                  failures.append({'ticker': ticker, 'error': str(err)})
+                  print(f'FAILED {ticker}: {err}')
+                  continue
+
+              result = chart['result'][0]
+              meta = result.get('meta') or {}
+              timestamps = result.get('timestamp') or []
+              quote_blocks = (result.get('indicators') or {}).get('quote') or []
+              quote = quote_blocks[0] if quote_blocks else {}
+              opens = quote.get('open') or []
+              highs = quote.get('high') or []
+              lows = quote.get('low') or []
+              closes = quote.get('close') or []
+              volumes = quote.get('volume') or []
+
+              rows_by_start = {}
+              for i, ts in enumerate(timestamps):
+                  values = []
+                  for arr in (opens, highs, lows, closes, volumes):
+                      values.append(arr[i] if i < len(arr) else None)
+                  o, h, l, c, v = values
+                  if None in (o, h, l, c):
+                      continue
+                  start_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(NY)
+                  if not (datetime.strptime(START_DATE, '%Y-%m-%d').date() <= start_dt.date() <= datetime.strptime(END_DATE_INCLUSIVE, '%Y-%m-%d').date()):
+                      continue
+                  # Regular session only: 09:30 <= bar start < 16:00 ET.
+                  minutes = start_dt.hour * 60 + start_dt.minute
+                  if not (570 <= minutes < 960):
+                      continue
+                  if start_dt.minute % 5 != 0:
+                      continue
+                  end_dt = start_dt + timedelta(minutes=5)
+                  key = start_dt.isoformat()
+                  rows_by_start[key] = [
+                      start_dt.date().isoformat(),
+                      start_dt.strftime('%H:%M:%S'),
+                      end_dt.strftime('%H:%M:%S'),
+                      float(o), float(h), float(l), float(c), int(v or 0),
+                  ]
+
+              rows = [rows_by_start[k] for k in sorted(rows_by_start)]
+              out_path = os.path.join(OUT, f'{ticker}.csv')
+              with open(out_path, 'w', newline='', encoding='utf-8') as f:
+                  writer = csv.writer(f)
+                  writer.writerow(['Date', 'Start Time', 'End Time', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                  writer.writerows(rows)
+
+              days = sorted({r[0] for r in rows})
+              expected = len(days) * 78
+              item = {
+                  'ticker': ticker,
+                  'exchange_name': meta.get('exchangeName'),
+                  'instrument_type': meta.get('instrumentType'),
+                  'currency': meta.get('currency'),
+                  'timezone': meta.get('exchangeTimezoneName') or 'America/New_York',
+                  'data_granularity': meta.get('dataGranularity'),
+                  'first_bar': (rows[0][0] + ' ' + rows[0][1]) if rows else None,
+                  'last_bar': (rows[-1][0] + ' ' + rows[-1][1]) if rows else None,
+                  'trading_days_with_data': len(days),
+                  'bars': len(rows),
+                  'expected_bars_for_days_with_data': expected,
+                  'missing_bars_within_days_with_data': max(0, expected - len(rows)),
+                  'source_url': url,
+              }
+              manifest.append(item)
+              print(f"OK {ticker}: {len(rows)} bars, {len(days)} days, missing {item['missing_bars_within_days_with_data']}")
+              time.sleep(1.5)
+
+          with open(os.path.join(OUT, 'manifest.json'), 'w', encoding='utf-8') as f:
+              json.dump({
+                  'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'requested_start_date': START_DATE,
+                  'requested_end_date_inclusive': END_DATE_INCLUSIVE,
+                  'interval': '5m',
+                  'session': 'regular 09:30-16:00 America/New_York',
+                  'source': 'Yahoo Finance v8 chart endpoint (unofficial)',
+                  'tickers_requested': TICKERS,
+                  'tickers_succeeded': [x['ticker'] for x in manifest],
+                  'tickers_failed': failures,
+                  'items': manifest,
+              }, f, ensure_ascii=False, indent=2)
+
+          if failures:
+              raise SystemExit('One or more tickers failed: ' + json.dumps(failures))
+          if len(manifest) != len(TICKERS):
+              raise SystemExit('Incomplete manifest')
+          for item in manifest:
+              if item['bars'] == 0:
+                  raise SystemExit('No regular-session bars for ' + item['ticker'])
+          print('ALL_TICKERS_OK')
+          PY
+
+      - name: Upload market data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-data-5min-2026-07-30-to-2026-08-28
+          path: market_data_5min/
+          if-no-files-found: error
+          retention-days: 1
