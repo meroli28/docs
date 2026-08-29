@@ -41,10 +41,8 @@ jobs:
           end_date = datetime.strptime(END_DATE_INCLUSIVE, '%Y-%m-%d').date()
           period1 = int(datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc).timestamp())
           period2 = int(datetime(2026, 8, 29, 0, 0, tzinfo=timezone.utc).timestamp())
-
           manifest = []
           failures = []
-          ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36'
 
           def fetch_json(ticker):
               params = {
@@ -54,40 +52,44 @@ jobs:
                   'includePrePost': 'false',
                   'events': 'div,splits',
               }
-              errors = []
-              hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
-              for host in hosts:
-                  url = 'https://' + host + '/v8/finance/chart/' + urllib.parse.quote(ticker) + '?' + urllib.parse.urlencode(params)
-                  for attempt in range(1, 4):
-                      proc = subprocess.run([
-                          'curl', '--fail-with-body', '--compressed', '--silent', '--show-error',
-                          '--connect-timeout', '10', '--max-time', '30', '--retry', '1',
-                          '--retry-all-errors', '--retry-delay', '2',
-                          '-A', ua, '-H', 'Accept: application/json,text/plain,*/*', url
-                      ], capture_output=True, text=True)
-                      if proc.returncode == 0:
-                          try:
-                              return json.loads(proc.stdout), url
-                          except Exception as exc:
-                              errors.append(f'{host} attempt {attempt}: invalid JSON: {exc}')
-                      else:
-                          errors.append(f'{host} attempt {attempt}: curl {proc.returncode}: {proc.stderr.strip()[:300]}')
-                      time.sleep(attempt * 2)
-              raise RuntimeError(' | '.join(errors))
+              query = urllib.parse.urlencode(params)
+              original_url = 'http://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker) + '?' + query
+              relay_url = 'https://r.jina.ai/' + original_url
+              last_error = None
+              for attempt in range(1, 3):
+                  proc = subprocess.run([
+                      'curl', '--fail-with-body', '--compressed', '--silent', '--show-error',
+                      '--connect-timeout', '12', '--max-time', '90',
+                      '-A', 'Mozilla/5.0', relay_url
+                  ], capture_output=True, text=True)
+                  if proc.returncode == 0:
+                      body = proc.stdout
+                      marker = 'Markdown Content:'
+                      if marker in body:
+                          body = body.split(marker, 1)[1].lstrip()
+                      try:
+                          return json.loads(body), original_url.replace('http://', 'https://', 1), relay_url
+                      except Exception as exc:
+                          last_error = f'invalid relayed JSON: {exc}; prefix={body[:120]!r}'
+                  else:
+                      last_error = f'curl {proc.returncode}: {proc.stderr.strip()[:350]}'
+                  if attempt == 1:
+                      time.sleep(65)
+              raise RuntimeError(last_error or 'unknown relay failure')
 
           for ticker in TICKERS:
               try:
-                  payload, url = fetch_json(ticker)
+                  payload, source_url, retrieval_url = fetch_json(ticker)
               except Exception as exc:
                   failures.append({'ticker': ticker, 'error': str(exc)})
-                  print(f'FAILED {ticker}: {exc}')
+                  print(f'FAILED {ticker}: {exc}', flush=True)
                   continue
 
               chart = payload.get('chart') or {}
               if chart.get('error') or not chart.get('result'):
                   err = chart.get('error') or 'missing chart.result'
                   failures.append({'ticker': ticker, 'error': str(err)})
-                  print(f'FAILED {ticker}: {err}')
+                  print(f'FAILED {ticker}: {err}', flush=True)
                   continue
 
               result = chart['result'][0]
@@ -113,9 +115,7 @@ jobs:
                   if not (start_date <= start_dt.date() <= end_date):
                       continue
                   minutes = start_dt.hour * 60 + start_dt.minute
-                  if not (570 <= minutes < 960):
-                      continue
-                  if start_dt.minute % 5 != 0:
+                  if not (570 <= minutes < 960) or start_dt.minute % 5:
                       continue
                   end_dt = start_dt + timedelta(minutes=5)
                   rows_by_start[start_dt.isoformat()] = [
@@ -126,6 +126,11 @@ jobs:
                   ]
 
               rows = [rows_by_start[k] for k in sorted(rows_by_start)]
+              if not rows:
+                  failures.append({'ticker': ticker, 'error': 'no regular-session bars after filtering'})
+                  print(f'FAILED {ticker}: no regular-session bars', flush=True)
+                  continue
+
               out_path = os.path.join(OUT, f'{ticker}.csv')
               with open(out_path, 'w', newline='', encoding='utf-8') as f:
                   writer = csv.writer(f)
@@ -136,24 +141,27 @@ jobs:
               expected = len(days) * 78
               item = {
                   'ticker': ticker,
+                  'long_name': meta.get('longName'),
+                  'short_name': meta.get('shortName'),
                   'exchange_name': meta.get('exchangeName'),
                   'full_exchange_name': meta.get('fullExchangeName'),
                   'instrument_type': meta.get('instrumentType'),
                   'currency': meta.get('currency'),
                   'timezone': meta.get('exchangeTimezoneName') or 'America/New_York',
                   'data_granularity': meta.get('dataGranularity'),
-                  'first_bar': (rows[0][0] + ' ' + rows[0][1]) if rows else None,
-                  'last_bar': (rows[-1][0] + ' ' + rows[-1][1]) if rows else None,
+                  'first_bar': rows[0][0] + ' ' + rows[0][1],
+                  'last_bar': rows[-1][0] + ' ' + rows[-1][1],
                   'trading_days_with_data': len(days),
                   'bars': len(rows),
                   'expected_bars_for_days_with_data': expected,
                   'missing_bars_within_days_with_data': max(0, expected - len(rows)),
                   'null_ohlc_rows_skipped': null_ohlc_rows,
-                  'source_url': url,
+                  'source_url': source_url,
+                  'retrieval_url': retrieval_url,
               }
               manifest.append(item)
-              print(f"OK {ticker}: {len(rows)} bars, {len(days)} days, missing {item['missing_bars_within_days_with_data']}")
-              time.sleep(2)
+              print(f"OK {ticker}: {len(rows)} bars, {len(days)} days, missing {item['missing_bars_within_days_with_data']}", flush=True)
+              time.sleep(1)
 
           with open(os.path.join(OUT, 'manifest.json'), 'w', encoding='utf-8') as f:
               json.dump({
@@ -162,7 +170,7 @@ jobs:
                   'requested_end_date_inclusive': END_DATE_INCLUSIVE,
                   'interval': '5m',
                   'session': 'regular 09:30-16:00 America/New_York',
-                  'source': 'Yahoo Finance v8 chart endpoint (unofficial)',
+                  'source': 'Yahoo Finance v8 chart endpoint (unofficial); transported through r.jina.ai textual relay',
                   'tickers_requested': TICKERS,
                   'tickers_succeeded': [x['ticker'] for x in manifest],
                   'tickers_failed': failures,
@@ -173,9 +181,7 @@ jobs:
               raise SystemExit('One or more tickers failed: ' + json.dumps(failures))
           if len(manifest) != len(TICKERS):
               raise SystemExit('Incomplete manifest')
-          for item in manifest:
-              if item['bars'] == 0:
-                  raise SystemExit('No regular-session bars for ' + item['ticker'])
+          print('TOTAL_BARS', sum(x['bars'] for x in manifest))
           print('ALL_TICKERS_OK')
           PY
 
