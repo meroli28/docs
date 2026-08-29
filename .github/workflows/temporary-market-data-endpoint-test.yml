@@ -1,0 +1,39 @@
+name: Temporary market data endpoint test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/temporary-market-data-endpoint-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-endpoints:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test public intraday endpoints
+        shell: bash
+        run: |
+          set +e
+          endpoints=(
+            'https://query1.finance.yahoo.com/v8/finance/chart/EC?interval=5m&range=1mo&includePrePost=false&events=div%2Csplits'
+            'https://query2.finance.yahoo.com/v8/finance/chart/EC?interval=5m&range=1mo&includePrePost=false&events=div%2Csplits'
+            'https://query1.finance.yahoo.com/v8/finance/chart/EC?period1=1785369600&period2=1787961600&interval=5m&includePrePost=false&events=div%2Csplits'
+            'https://query2.finance.yahoo.com/v8/finance/chart/EC?period1=1785369600&period2=1787961600&interval=5m&includePrePost=false&events=div%2Csplits'
+          )
+          n=0
+          for url in "${endpoints[@]}"; do
+            n=$((n+1))
+            echo "=== ENDPOINT $n ==="
+            echo "$url"
+            curl --connect-timeout 8 --max-time 20 --retry 1 --retry-delay 2 -A 'Mozilla/5.0' -sS -D /tmp/headers.txt -o /tmp/body.txt "$url"
+            rc=$?
+            echo "curl_rc=$rc"
+            head -n 5 /tmp/headers.txt || true
+            echo "body_bytes=$(wc -c < /tmp/body.txt 2>/dev/null || echo 0)"
+            head -c 500 /tmp/body.txt || true
+            echo
+          done
