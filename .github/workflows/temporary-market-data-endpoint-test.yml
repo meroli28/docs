@@ -19,7 +19,7 @@ jobs:
         run: |
           set +e
           target='https://query1.finance.yahoo.com/v8/finance/chart/EC?period1=1785369600&period2=1787961600&interval=5m&includePrePost=false&events=div%2Csplits'
-          encoded=$(python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["TARGET"], safe=""))' TARGET="$target")
+          encoded=$(TARGET="$target" python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["TARGET"], safe=""))')
           endpoints=(
             "https://r.jina.ai/http://query1.finance.yahoo.com/v8/finance/chart/EC?period1=1785369600&period2=1787961600&interval=5m&includePrePost=false&events=div%2Csplits"
             "https://r.jina.ai/https://query1.finance.yahoo.com/v8/finance/chart/EC?period1=1785369600&period2=1787961600&interval=5m&includePrePost=false&events=div%2Csplits"
